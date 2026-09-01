@@ -1,0 +1,40 @@
+{% comment %}
+  Free Gift — theme app embed.
+  Reads the tier config (shop metafield, storefront PUBLIC_READ) and hands it to
+  free-gift.js, which auto-adds/removes the gift so the native BXGY discount
+  applies. Enable under Theme editor → App embeds → Free Gift.
+{% endcomment %}
+
+{% assign tiers = shop.metafields.theskinfit_gift.gift_tiers.value %}
+
+{% if tiers %}
+  <script>
+    window.__TSF_GIFT_TIERS__ = {{ tiers | json }};
+    window.__TSF_GIFT_PROP__ = "_gift";
+  </script>
+
+  <div id="tsf-gift-popup" class="tsf-gift-popup" role="status" aria-live="polite" hidden>
+    <span class="tsf-gift-popup__icon">🎁</span>
+    <span class="tsf-gift-popup__text"></span>
+  </div>
+
+  <script src="{{ 'free-gift.js' | asset_url }}" defer></script>
+
+  {% style %}
+    .tsf-gift-popup{
+      position:fixed; left:20px; bottom:20px; z-index:2147483646;
+      pointer-events:none;            /* passive toast — never intercept clicks (e.g. checkout) */
+      display:flex; align-items:center; gap:10px; max-width:320px;
+      padding:14px 18px; background:#0B7A3B; color:#fff; border-radius:12px;
+      box-shadow:0 8px 24px rgba(0,0,0,.18); font-size:14px; line-height:1.35;
+      transform:translateY(16px); opacity:0;
+      transition:opacity .25s ease, transform .25s ease;
+    }
+    .tsf-gift-popup[data-show="true"]{ transform:translateY(0); opacity:1; }
+    .tsf-gift-popup__icon{ font-size:20px; }
+  {% endstyle %}
+{% endif %}
+
+{% schema %}
+{ "name": "Free Gift", "target": "body", "settings": [] }
+{% endschema %}

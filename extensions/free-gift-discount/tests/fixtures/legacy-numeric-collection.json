@@ -1,0 +1,59 @@
+{
+  "cart": {
+    "lines": [
+      {
+        "id": "gid://shopify/CartLine/own",
+        "cost": {
+          "subtotalAmount": {
+            "amount": "8000.0"
+          }
+        },
+        "giftTier": null,
+        "merchandise": {
+          "__typename": "ProductVariant",
+          "product": {
+            "id": "gid://shopify/Product/8495381020742"
+          }
+        }
+      },
+      {
+        "id": "gid://shopify/CartLine/gc",
+        "cost": {
+          "subtotalAmount": {
+            "amount": "9900.0"
+          }
+        },
+        "giftTier": {
+          "value": "t_coll"
+        },
+        "merchandise": {
+          "__typename": "ProductVariant",
+          "product": {
+            "id": "gid://shopify/Product/GIFT"
+          }
+        }
+      }
+    ]
+  },
+  "discount": {
+    "discountClasses": [
+      "PRODUCT"
+    ],
+    "metafield": {
+      "jsonValue": {
+        "tiers": [
+          {
+            "id": "t_coll",
+            "name": "Collection 5K",
+            "type": "collection_subtotal",
+            "threshold": 5000,
+            "enabled": true,
+            "collectionProductIds": [
+              8495381020742
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

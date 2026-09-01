@@ -1,0 +1,21 @@
+api_version = "2026-07"
+
+[[extensions]]
+name = "t:name"
+handle = "free-gift-discount"
+type = "function"
+uid = "23c96fdf-71ac-f39b-5536-97145ee1e800d1e209ee"
+description = "t:description"
+
+  # Product-discount target only. The scaffold also wires up
+  # cart.delivery-options.discounts.generate.run, whose sample code hands out FREE
+  # DELIVERY — this app has no business touching shipping, and declaring the
+  # target would give the discount the SHIPPING class as well. Removed on purpose.
+  [[extensions.targeting]]
+  target = "cart.lines.discounts.generate.run"
+  input_query = "src/cart_lines_discounts_generate_run.graphql"
+  export = "cart-lines-discounts-generate-run"
+
+  [extensions.build]
+  command = ""
+  path = "dist/function.wasm"

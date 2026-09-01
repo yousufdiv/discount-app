@@ -1,0 +1,48 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "84543886ba4dae45627d49741ba7a5e1"
+name = "discount-app"
+application_url = "https://example.com"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = true
+
+[webhooks]
+api_version = "2026-07"
+
+  [[webhooks.subscriptions]]
+  topics = [ "app/uninstalled" ]
+  uri = "/webhooks/app/uninstalled"
+
+  [[webhooks.subscriptions]]
+  topics = [ "app/scopes_update" ]
+  uri = "/webhooks/app/scopes_update"
+
+# Required by Shopify CLI 4.7.0 even for an app that subscribes to no events:
+# leaving it out fails `app deploy` and `app dev` with "[events]: Required", and
+# both fields below are mandatory. The empty list declares zero subscriptions,
+# so this section is a no-op — do not delete it, and do not add topics here
+# unless the app genuinely needs to receive events.
+#
+# api_version must be "unstable": this module is still in preview and the server
+# rejects a dated version ("Expected 'unstable'. Received '2026-07'"). It is
+# deliberately not kept in step with [webhooks].api_version above.
+[events]
+api_version = "unstable"
+subscription = []
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+scopes = "write_products,write_discounts,read_products"
+
+# Declares this app's reserved discount metafield, read by the discount function
+# as metafield(namespace: "$app", key: "function-configuration").
+[discount.metafields.app.function-configuration]
+type = "json"
+name = "Function configuration"
+access.admin = "merchant_read_write"
+access.storefront = "none"
+
+[auth]
+redirect_urls = [ "https://example.com/api/auth" ]

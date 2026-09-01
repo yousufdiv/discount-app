@@ -1,0 +1,39 @@
+{
+  "cart": {
+    "lines": [
+      { "id": "gid://shopify/CartLine/own1",
+        "cost": { "subtotalAmount": { "amount": "8000.0" } },
+        "giftTier": null,
+        "merchandise": { "__typename": "ProductVariant", "product": { "id": "gid://shopify/Product/COLL_A" } } },
+      { "id": "gid://shopify/CartLine/own2",
+        "cost": { "subtotalAmount": { "amount": "4000.0" } },
+        "giftTier": null,
+        "merchandise": { "__typename": "ProductVariant", "product": { "id": "gid://shopify/Product/PLAIN" } } },
+      { "id": "gid://shopify/CartLine/gift5k",
+        "cost": { "subtotalAmount": { "amount": "200.0" } },
+        "giftTier": { "value": "t_order5k" },
+        "merchandise": { "__typename": "ProductVariant", "product": { "id": "gid://shopify/Product/GIFT1" } } },
+      { "id": "gid://shopify/CartLine/gift10k",
+        "cost": { "subtotalAmount": { "amount": "950.0" } },
+        "giftTier": { "value": "t_order10k" },
+        "merchandise": { "__typename": "ProductVariant", "product": { "id": "gid://shopify/Product/GIFT2" } } },
+      { "id": "gid://shopify/CartLine/giftcoll",
+        "cost": { "subtotalAmount": { "amount": "9900.0" } },
+        "giftTier": { "value": "t_coll5k" },
+        "merchandise": { "__typename": "ProductVariant", "product": { "id": "gid://shopify/Product/GIFT3" } } }
+    ]
+  },
+  "discount": {
+    "discountClasses": ["PRODUCT"],
+    "metafield": {
+      "jsonValue": {
+        "tiers": [
+          { "id": "t_order5k",  "name": "Freebie over 5K",  "type": "order_subtotal",      "threshold": 5000,  "enabled": true },
+          { "id": "t_order10k", "name": "Freebie over 10K", "type": "order_subtotal",      "threshold": 10000, "enabled": true },
+          { "id": "t_coll5k",   "name": "Collection 5K",    "type": "collection_subtotal", "threshold": 5000,  "enabled": true,
+            "collectionProductGids": ["gid://shopify/Product/COLL_A"] }
+        ]
+      }
+    }
+  }
+}
