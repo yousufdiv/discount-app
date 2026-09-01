@@ -82,15 +82,27 @@ export function cartLinesDiscountsGenerateRun(input) {
     });
   };
 
+  // A tier can be a window rather than a floor: "gift on orders of Rs 6,000 to
+  // Rs 7,999" is threshold 6000 with thresholdMax 7999. Both ends are inclusive,
+  // and no cap (absent, null, or zero) means the tier stays open-ended, which is
+  // what every tier saved before this existed relies on.
+  const withinRange = (value, tier) => {
+    if (value < Number(tier.threshold ?? 0)) return false;
+    const max = Number(tier.thresholdMax);
+    return !(max > 0) || value <= max;
+  };
+
   const qualifies = (tier) => {
-    const threshold = Number(tier.threshold ?? 0);
     switch (tier.type) {
       case 'order_subtotal':
-        return ownSubtotal >= threshold;
+        return withinRange(ownSubtotal, tier);
       case 'collection_contains':
         return linesInCollection(tier).length > 0;
       case 'collection_subtotal':
-        return linesInCollection(tier).reduce((sum, line) => sum + amountOf(line), 0) >= threshold;
+        return withinRange(
+          linesInCollection(tier).reduce((sum, line) => sum + amountOf(line), 0),
+          tier,
+        );
       default:
         return false;
     }

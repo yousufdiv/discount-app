@@ -149,9 +149,21 @@
     return 0;
   }
 
+  /**
+   * A threshold tier can be a window rather than a floor: "gift on orders of
+   * Rs 6,000 to Rs 7,999" is threshold 6000 with thresholdMax 7999. Both ends are
+   * inclusive. No cap — absent, null or zero — leaves the tier open-ended, which
+   * is what every tier saved before thresholdMax existed relies on.
+   *
+   * The discount function applies the identical rule, so a gift the theme hands
+   * out is always one the function will make free.
+   */
   function qualifies(tier, cart) {
     var v = measure(tier, cart);
-    return tier.type === "collection_contains" ? v > 0 : v >= tier.threshold;
+    if (tier.type === "collection_contains") return v > 0;
+    if (v < tier.threshold) return false;
+    var max = Number(tier.thresholdMax);
+    return !(max > 0) || v <= max;
   }
 
   // ---- write ---------------------------------------------------------------
@@ -198,6 +210,15 @@
     return themeSections || null;
   }
 
+  /**
+   * POST to the Ajax Cart API, resolving to { ok, status, body }.
+   *
+   * The parsed body matters as much as the status. cart/change.js and
+   * cart/update.js return the WHOLE resulting cart, so a caller can verify what
+   * it just did straight from the response instead of making another /cart.js
+   * request — that follow-up read, once per attempt, was a large part of the
+   * removal lag. cart/add.js returns only the added line(s), hence isFullCart().
+   */
   function post(path, body) {
     mutations++;
     unobservedMutation = true;
@@ -214,38 +235,60 @@
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify(body),
     }).then(function (res) {
-      // Peek at the body without consuming it for the caller.
-      res
-        .clone()
-        .json()
-        .then(function (data) { if (data && data.sections) lastSections = data.sections; })
-        .catch(function () {});
-      return res;
+      // Read the body here rather than peeking at a clone in the background: the
+      // background read finished after the caller had already moved on, so
+      // lastSections could still be empty when we told the theme to re-render,
+      // costing it a round trip of its own.
+      return res.json().then(
+        function (data) {
+          if (data && data.sections) lastSections = data.sections;
+          return { ok: res.ok, status: res.status, body: data };
+        },
+        function () { return { ok: res.ok, status: res.status, body: null }; },
+      );
     });
   }
 
+  /** True for a response body that is a complete cart, usable in place of a read. */
+  function isFullCart(o) {
+    return !!(o && Array.isArray(o.items) && typeof o.item_count === "number");
+  }
+
   /**
-   * Apply removals and adds. With standard actions this is ONE atomic updateCart
-   * call for the whole batch instead of a mutation per line — one re-render, one
-   * chance to desync the theme, rather than several.
+   * Apply removals and adds, and resolve to the resulting cart when we know it
+   * (null means the caller has to read it).
+   *
+   * `cart` is the cart the plan was made from. Reusing it instead of re-reading is
+   * most of the speed-up here: the round trips this function used to make before
+   * touching anything were what made a gift take three or four seconds to appear.
    */
-  function applyChanges(addTiers, removeTierIds) {
-    if (!addTiers.length && !removeTierIds.length) return Promise.resolve();
-    if (!mutationBudget()) return Promise.resolve();
+  function applyChanges(addTiers, removeTierIds, cart) {
+    if (!addTiers.length && !removeTierIds.length) return Promise.resolve(null);
+    if (!mutationBudget()) return Promise.resolve(null);
 
-    if (!canUseActions()) {
-      return removeSequentially(removeTierIds.slice()).then(function () {
-        return addSequentially(addTiers.slice());
-      });
-    }
+    if (!canUseActions()) return ajaxChanges(addTiers, removeTierIds, cart);
 
-    return giftLineIdsByTier().then(function (byTier) {
+    // Only a removal needs a storefront line id; an add is addressed by variant.
+    // Fetching the cart when there is nothing to remove was a wasted round trip
+    // on the commonest path of all — the customer just crossed a threshold.
+    var idsPromise = removeTierIds.length ? giftLineIdsByTier() : Promise.resolve({});
+
+    return idsPromise.then(function (byTier) {
       var lines = [];
       var unresolved = [];
       removeTierIds.forEach(function (id) {
         if (byTier && byTier[id]) lines.push({ id: byTier[id], quantity: 0 });
         else unresolved.push(id);
       });
+
+      // Half by updateCart and half by Ajax within one pass is how the theme ended
+      // up rendering a cart that no longer existed. If any line can't be addressed
+      // by storefront id, do the whole batch one way — over the Ajax API.
+      if (unresolved.length) {
+        debug("no storefront line id for", unresolved, "— whole batch over the Ajax API");
+        return ajaxChanges(addTiers, removeTierIds, cart);
+      }
+
       addTiers.forEach(function (t) {
         lines.push({
           merchandiseId: variantGid(t),
@@ -253,25 +296,26 @@
           attributes: [{ key: GIFT_PROP, value: t.id }],
         });
       });
+      if (!lines.length) return null;
 
-      var step = Promise.resolve();
-      if (lines.length) {
-        mutations++;
-        step = Shopify.actions
-          .updateCart({ lines: lines }, actionOpts)
-          .then(function (r) {
-            if (r && r.userErrors && r.userErrors.length) debug("updateCart userErrors", r.userErrors);
-            if (r && r.warnings && r.warnings.length) debug("updateCart warnings", r.warnings);
-          })
-          .catch(function (e) { debug("updateCart threw", e); });
-      }
-      return step.then(function () {
-        if (!unresolved.length) return null;
-        // getCart didn't expose attributes, so we couldn't address these lines by
-        // storefront id. Fall back to the Ajax API, which always can.
-        debug("no storefront line id for", unresolved, "— using Ajax removal");
-        return removeSequentially(unresolved);
-      });
+      mutations++;
+      return Shopify.actions
+        .updateCart({ lines: lines }, actionOpts)
+        .then(function (r) {
+          if (r && r.userErrors && r.userErrors.length) debug("updateCart userErrors", r.userErrors);
+          if (r && r.warnings && r.warnings.length) debug("updateCart warnings", r.warnings);
+          return null; // not the Ajax cart shape — the caller must read the cart
+        })
+        .catch(function (e) { debug("updateCart threw", e); return null; });
+    });
+  }
+
+  /** Removals then adds, entirely over the Ajax API. Resolves to a cart or null. */
+  function ajaxChanges(addTiers, removeTierIds, cart) {
+    return removeGiftsAjax(removeTierIds, cart).then(function (after) {
+      if (!addTiers.length) return after;
+      // cart/add.js returns only the added line, so the cart we hold is stale now.
+      return addSequentially(addTiers.slice()).then(function () { return null; });
     });
   }
 
@@ -285,65 +329,97 @@
       .then(function () { return addSequentially(queue); });
   }
 
-  function removeSequentially(queue) {
-    if (!queue.length) return Promise.resolve();
-    var id = queue.shift();
-    return removeOneGift(id).then(function () { return removeSequentially(queue); });
-  }
-
   /**
-   * Remove a single gift line, trying each documented way of addressing a line
-   * until the line is actually gone, verifying after every attempt.
+   * Remove gift lines for the given tiers, in as few requests as possible, and
+   * resolve to the resulting cart.
    *
-   * One strategy is not enough. A line key changes whenever the line's properties
-   * or discount applications change, and a line index shifts on every removal —
-   * so the same request can silently match nothing, which is exactly how a gift
-   * stayed in the cart while its discount disappeared.
+   * cart/update.js takes a map of line key -> quantity, so every gift comes out in
+   * ONE request rather than one request each, and its response is the whole cart,
+   * so the removal is verified from that instead of a follow-up /cart.js read.
+   * Removing two gifts used to cost six round trips; it now costs one.
+   *
+   * Verification is not optional, and neither is the fallback. A line key is
+   * rewritten whenever the line's properties or discount applications change, and
+   * a 1-based line index shifts on every removal, so a request addressing a stale
+   * one silently matches nothing — which is exactly how a gift stayed in the cart
+   * while its discount vanished.
    * https://shopify.dev/docs/api/ajax/reference/cart
    */
-  function removeOneGift(tierId) {
-    return readCart().then(function (cart) {
+  function removeGiftsAjax(tierIds, cart) {
+    if (!tierIds.length) return Promise.resolve(cart);
+
+    function present(c, ids) {
+      return ids.filter(function (id) {
+        return c.items.some(function (l) { return isGift(l) && tierIdOf(l) === id; });
+      });
+    }
+    // change.js/update.js hand back the cart; anything else means we must read it.
+    function cartFrom(result) {
+      return isFullCart(result.body) ? Promise.resolve(result.body) : readCart();
+    }
+
+    function batch(c) {
+      var updates = {};
+      var found = 0;
+      c.items.forEach(function (l) {
+        if (isGift(l) && tierIds.indexOf(tierIdOf(l)) !== -1) { updates[l.key] = 0; found++; }
+      });
+      if (!found) return Promise.resolve(c);
+      return post("cart/update.js", { updates: updates })
+        .then(cartFrom)
+        .catch(function () { return readCart(); });
+    }
+
+    // Per-line fallback, re-reading between tries because a successful removal
+    // shifts the indices of everything after it.
+    function one(id, c) {
       var line = null;
       var index = -1;
-      for (var i = 0; i < cart.items.length; i++) {
-        if (isGift(cart.items[i]) && tierIdOf(cart.items[i]) === tierId) {
-          line = cart.items[i];
+      for (var i = 0; i < c.items.length; i++) {
+        if (isGift(c.items[i]) && tierIdOf(c.items[i]) === id) {
+          line = c.items[i];
           index = i + 1; // Shopify's `line` parameter is 1-based
           break;
         }
       }
-      if (!line) return true; // already gone
+      if (!line) return Promise.resolve(c);
 
-      var updates = {};
-      updates[line.key] = 0;
       var attempts = [
-        { how: "change.js id=key", path: "cart/change.js", body: { id: line.key, quantity: 0 } },
-        { how: "update.js updates[key]", path: "cart/update.js", body: { updates: updates } },
-        { how: "change.js line=index", path: "cart/change.js", body: { line: index, quantity: 0 } },
+        { how: "change.js id=key", body: { id: line.key, quantity: 0 } },
+        { how: "change.js line=index", body: { line: index, quantity: 0 } },
       ];
-
-      function attempt(n) {
+      function attempt(n, current) {
         if (n >= attempts.length) {
-          debug("FAILED to remove gift line for", tierId, "— all strategies exhausted");
-          return false;
+          debug("FAILED to remove gift line for", id, "— all strategies exhausted");
+          return Promise.resolve(current);
         }
-        var a = attempts[n];
-        return post(a.path, a.body)
-          .then(function () { return readCart(); })
-          .then(function (fresh) {
-            var stillThere = fresh.items.some(function (l) {
-              return isGift(l) && tierIdOf(l) === tierId;
-            });
-            if (!stillThere) {
-              debug("removed gift", tierId, "via", a.how);
-              return true;
+        return post("cart/change.js", attempts[n].body)
+          .then(cartFrom)
+          .then(function (after) {
+            if (!present(after, [id]).length) {
+              debug("removed gift", id, "via", attempts[n].how);
+              return after;
             }
-            debug("removal attempt did not stick:", a.how);
-            return attempt(n + 1);
+            debug("removal attempt did not stick:", attempts[n].how);
+            return attempt(n + 1, after);
           })
-          .catch(function () { return attempt(n + 1); });
+          .catch(function () {
+            return readCart().then(function (after) { return attempt(n + 1, after); });
+          });
       }
-      return attempt(0);
+      return attempt(0, c);
+    }
+
+    function sweep(ids, c) {
+      if (!ids.length) return Promise.resolve(c);
+      return one(ids[0], c).then(function (after) { return sweep(ids.slice(1), after); });
+    }
+
+    return batch(cart).then(function (after) {
+      var left = present(after, tierIds);
+      if (!left.length) return after;
+      debug("batch removal left", left, "— falling back to per-line removal");
+      return sweep(left, after);
     });
   }
 
@@ -353,7 +429,13 @@
    * lines don't carry attributes), in which case we fall back to the Ajax API,
    * which always gives us a usable line key.
    */
+  // Set once we've established that this storefront's getCart payload cannot
+  // identify our gift lines. Without it we made that round trip before every
+  // single removal and threw the answer away every time.
+  var storefrontLineIdsUnavailable = false;
+
   function giftLineIdsByTier() {
+    if (storefrontLineIdsUnavailable) return Promise.resolve(null);
     if (!canUseActions() || typeof Shopify.actions.getCart !== "function") {
       return Promise.resolve(null);
     }
@@ -379,7 +461,11 @@
         // No attributes. Try the gift's variant instead — but only if the payload
         // even carries one. On this storefront getCart returns just id/quantity/cost,
         // so there is nothing to match on and an extra cart read would be wasted.
+        // That's a fact about the storefront, not about this cart, so remember it
+        // and stop asking.
         if (!lines.some(function (l) { return l.merchandise && l.merchandise.id; })) {
+          storefrontLineIdsUnavailable = true;
+          debug("getCart can't identify gift lines here — using the Ajax API from now on");
           return null;
         }
 
@@ -487,22 +573,21 @@
   }
 
   // Needed after any mutation the theme couldn't observe.
-  function refreshTheme() {
-    // Read the cart so the event carries the real post-change state — themes put
-    // it straight into their UI (item count, totals) with no further requests.
-    return readCart()
-      .catch(function () { return null; })
-      .then(function (cart) {
-        // Only trust the events if there's some sign this theme listens for them.
-        // Otherwise an old theme would silently keep showing a stale cart.
-        var listens =
-          standardEventsSeen || canUseActions() || !!document.querySelector("cart-items-component");
-        if (notifyThemeOfCartChange(cart) && listens) {
-          debug("notified the theme", lastSections ? "(with rendered sections)" : "(no sections)");
-          return null;
-        }
-        return legacyRefresh();
-      });
+  //
+  // `cart` is the post-change cart the reconcile pass already has. Themes put it
+  // straight into their UI (item count, totals) with no further requests, and
+  // re-reading it here just to hand it over was one more round trip sitting on
+  // the critical path between the gift landing and the drawer showing it.
+  function refreshTheme(cart) {
+    // Only trust the events if there's some sign this theme listens for them.
+    // Otherwise an old theme would silently keep showing a stale cart.
+    var listens =
+      standardEventsSeen || canUseActions() || !!document.querySelector("cart-items-component");
+    if (notifyThemeOfCartChange(cart || null) && listens) {
+      debug("notified the theme", lastSections ? "(with rendered sections)" : "(no sections)");
+      return Promise.resolve(null);
+    }
+    return legacyRefresh();
   }
 
   function legacyRefresh() {
@@ -551,7 +636,7 @@
   // Bounded, so a misconfigured pair of tiers can't spin forever.
   var MAX_PASSES = 4;
 
-  function reconcile() {
+  function reconcile(initialCart) {
     if (busy) return;
     busy = true;
 
@@ -559,34 +644,53 @@
     unobservedMutation = false;
     lastSections = null; // never hand the theme section HTML from an earlier run
 
-    function loop(depth) {
+    // Each pass hands the next one the cart it ended with. A pass that finds
+    // nothing left to do then costs no network at all — and there is always such
+    // a pass, because the loop only stops once the cart stops changing.
+    function loop(depth, cart) {
       if (depth >= MAX_PASSES) {
         debug("hit MAX_PASSES — giving up this run");
-        return Promise.resolve();
+        return Promise.resolve(cart);
       }
-      return onePass().then(function (changed) {
-        if (!changed) return null;
+      return onePass(cart).then(function (r) {
+        if (!r.changed) return r.cart;
         changedAny = true;
-        return loop(depth + 1);
+        return loop(depth + 1, r.cart);
       });
     }
 
-    loop(0)
-      .then(function () {
+    function done() {
+      busy = false;
+      // A cart change that arrived mid-run was previously dropped: the trigger
+      // recorded the new signature and then found reconcile() busy, so nothing
+      // ever acted on it. Pick it up now instead.
+      if (rerunRequested) {
+        rerunRequested = false;
+        scheduleReconcile();
+      }
+    }
+
+    (initialCart ? Promise.resolve(initialCart) : readCart())
+      .then(function (cart) { return loop(0, cart); })
+      .then(function (cart) {
         // updateCart refreshes the theme's cart UI itself, but an Ajax mutation
         // doesn't — and we fall back to Ajax whenever a storefront line id can't
         // be resolved. Keying this off canUseActions() alone was the bug: the
         // removal succeeded server-side while the theme kept rendering the old
         // cart. Refresh whenever anything went through an unobserved route.
-        if (changedAny && (unobservedMutation || !canUseActions())) return refreshTheme();
+        if (changedAny && (unobservedMutation || !canUseActions())) return refreshTheme(cart);
         return null;
       })
-      .then(function () { busy = false; })
-      .catch(function () { busy = false; });
+      .then(done)
+      .catch(function (e) { debug("reconcile failed", e); done(); });
   }
 
-  /** One reconcile pass. Resolves true when it actually changed the cart. */
-  function onePass() {
+  /**
+   * One reconcile pass over the given cart. Resolves to { changed, cart }, where
+   * `cart` is the freshest state this pass knows about — the next pass plans from
+   * it directly instead of re-reading.
+   */
+  function onePass(cart) {
     var wanted = [];       // tiers we attempted to add this pass
     var removals = [];     // tier ids whose gift should come out
     var qualifying = {};   // tierId -> whether its condition holds right now
@@ -634,7 +738,8 @@
       debug("pass", {
         tiers: TIERS.map(function (t) {
           return {
-            id: t.id, name: t.name, type: t.type, threshold: t.threshold,
+            id: t.id, name: t.name, type: t.type,
+            threshold: t.threshold, thresholdMax: t.thresholdMax || null,
             measured: measure(t, cart), qualifies: qualifies(t, cart),
             inCart: !!present[t.id],
             blocked: isBlocked(t.id, fingerprint),
@@ -677,8 +782,8 @@
         }
       });
 
-      return applyChanges([], payable)
-        .then(readCart)
+      return applyChanges([], payable, cart)
+        .then(function (after) { return after || readCart(); })
         .then(function (fresh) { return { cart: fresh, payable: payable }; });
     }
 
@@ -714,31 +819,35 @@
         document.dispatchEvent(new CustomEvent("tsf:gift-updated"));
       }
 
-      return added.length > 0 || removedCount > 0 || payable.length > 0;
+      // Hand the cart on as well as the verdict: the next pass plans from it
+      // rather than reading it again.
+      return {
+        changed: added.length > 0 || removedCount > 0 || payable.length > 0,
+        cart: cart,
+      };
     }
 
-    return readCart().then(function (cart) {
-      plan(cart);
-      if (!wanted.length && !removals.length) {
-        // Nothing to do — but an existing gift line may still be payable (the
-        // merchant just deleted its discount), so always run the safety net.
-        return dropPayableGifts(cart).then(function (r) {
-          if (!r.payable.length) return false;
-          return finish(r.cart, r.payable);
-        });
-      }
+    plan(cart);
+    if (!wanted.length && !removals.length) {
+      // Nothing to do — but an existing gift line may still be payable (the
+      // merchant just deleted its discount), so always run the safety net.
+      return dropPayableGifts(cart).then(function (r) {
+        if (!r.payable.length) return { changed: false, cart: r.cart };
+        return finish(r.cart, r.payable);
+      });
+    }
 
-      // One atomic batch: adds and removals together, so the theme's rendered
-      // line keys and indices are invalidated once instead of once per line.
-      return applyChanges(wanted, removals)
-        // Trust nothing: re-read and see what is actually in the cart. This is
-        // what keeps the popup honest — a gift that failed to add (sold out,
-        // inventory policy "deny", quantity limits) won't be here — and it's how
-        // we catch a removal that silently didn't take effect.
-        .then(readCart)
-        .then(dropPayableGifts)
-        .then(function (r) { return finish(r.cart, r.payable); });
-    });
+    // One atomic batch: adds and removals together, so the theme's rendered
+    // line keys and indices are invalidated once instead of once per line.
+    return applyChanges(wanted, removals, cart)
+      // Trust nothing: work from what is actually in the cart afterwards. This is
+      // what keeps the popup honest — a gift that failed to add (sold out,
+      // inventory policy "deny", quantity limits) won't be there — and it's how we
+      // catch a removal that silently didn't take effect. When the mutation
+      // already handed back the whole cart we use that; only otherwise do we read.
+      .then(function (after) { return after || readCart(); })
+      .then(dropPayableGifts)
+      .then(function (r) { return finish(r.cart, r.payable); });
   }
 
   // ---- popup ---------------------------------------------------------------
@@ -792,14 +901,38 @@
   }
 
   function maybeReconcile() {
+    // Don't spend a cart read to discover we can't act on it. The run in flight
+    // will be told to go round again when it finishes.
+    if (busy) { rerunRequested = true; return; }
     readCart()
       .then(function (cart) {
         var sig = signature(cart);
         if (sig === lastSig) return;
         lastSig = sig;
-        reconcile();
+        // Hand the cart straight to reconcile — it used to read it all over again.
+        reconcile(cart);
       })
       .catch(function () {});
+  }
+
+  /**
+   * Coalesce a burst of cart requests into one reconcile.
+   *
+   * Themes routinely fire several requests for a single click, and each trigger
+   * used to sit behind a flat 300ms wait — paid once per trigger, on top of every
+   * round trip that followed. A short window merges the burst instead, so we react
+   * roughly a quarter of a second sooner and still only run once.
+   */
+  var RECONCILE_DEBOUNCE_MS = 60;
+  var scheduled = null;
+  var rerunRequested = false;
+
+  function scheduleReconcile() {
+    if (scheduled) clearTimeout(scheduled);
+    scheduled = setTimeout(function () {
+      scheduled = null;
+      maybeReconcile();
+    }, RECONCILE_DEBOUNCE_MS);
   }
 
   // 1. Standard storefront event — theme-agnostic, no DOM or fetch knowledge.
@@ -819,9 +952,9 @@
     }
     var p = e.promise;
     if (p && typeof p.then === "function") {
-      p.then(function () { maybeReconcile(); }).catch(function () {});
+      p.then(function () { scheduleReconcile(); }).catch(function () {});
     } else {
-      setTimeout(maybeReconcile, 300);
+      scheduleReconcile();
     }
   });
 
@@ -839,7 +972,7 @@
       rememberSections(init && init.body);
       var p = origFetch.apply(this, arguments);
       if (!standardEventsSeen) {
-        p.then(function () { setTimeout(maybeReconcile, 300); }).catch(function () {});
+        p.then(function () { scheduleReconcile(); }).catch(function () {});
       }
       return p;
     }
@@ -857,7 +990,7 @@
     if (this.__tsfCart) {
       rememberSections(body);
       if (!standardEventsSeen) {
-        this.addEventListener("load", function () { setTimeout(maybeReconcile, 300); });
+        this.addEventListener("load", function () { scheduleReconcile(); });
       }
     }
     return XhrSend.apply(this, arguments);
@@ -917,6 +1050,7 @@
             name: t.name,
             type: t.type,
             threshold: t.threshold,
+            thresholdMax: t.thresholdMax || null,
             giftVariantId: t.giftVariantId,
             measured: measure(t, cart),
             qualifies: qualifies(t, cart),

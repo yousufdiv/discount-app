@@ -42,6 +42,17 @@ const FN_CONFIG_NAMESPACES = ["$app", "app"];
 const numId = (gid) => (gid ? Number(String(gid).split("/").pop()) : null);
 
 /**
+ * An optional upper bound on a tier's threshold, so a tier can be a window
+ * ("gift on orders of Rs 6,000 to Rs 7,999") instead of a floor. Blank, zero and
+ * anything unparseable all mean no cap — tiers saved before this field existed
+ * must keep behaving as open-ended.
+ */
+const capOrNull = (raw) => {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : null;
+};
+
+/**
  * True when a mutation failed because the discount is no longer there — the
  * merchant deleted it directly in the Shopify admin. Shopify reports this as
  * "Automatic discount does not exist."
@@ -191,6 +202,7 @@ function functionConfig(tiers) {
         name: t.name,
         type: t.type,
         threshold: t.threshold,
+        thresholdMax: t.thresholdMax ?? null,
         enabled: true,
         collectionProductGids: t.collectionProductGids ?? [],
       })),
@@ -315,6 +327,7 @@ export async function upsertTier(admin, form) {
     name: form.name?.trim() || "Free gift tier",
     type: form.type,
     threshold: form.type === "collection_contains" ? 0 : Number(form.threshold) || 0,
+    thresholdMax: form.type === "collection_contains" ? null : capOrNull(form.thresholdMax),
     collectionGid: form.collectionGid || null,
     collectionId: numId(form.collectionGid),
     collectionProductIds: [],  // numeric, for the theme

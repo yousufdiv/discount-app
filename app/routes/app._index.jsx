@@ -42,8 +42,13 @@ export default function Index() {
 
   const money = (n) => `Rs${Number(n).toLocaleString("en-PK")}`;
   const act = (intent, id) => submit({ intent, id }, { method: "post" });
-  const condition = (t) =>
-    t.type === "collection_contains" ? "≥ 1 item" : `≥ ${money(t.threshold)}`;
+  const condition = (t) => {
+    if (t.type === "collection_contains") return "≥ 1 item";
+    // A capped tier is a window, not a floor — showing only "≥ Rs 6,000" would
+    // hide the fact that it stops paying out at Rs 8,000.
+    if (t.thresholdMax > 0) return `${money(t.threshold)} – ${money(t.thresholdMax)}`;
+    return `≥ ${money(t.threshold)}`;
+  };
 
   // Tiers created before these fields existed have no timestamps — show a dash
   // rather than "Invalid Date".

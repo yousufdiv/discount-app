@@ -1,0 +1,25 @@
+{
+  "cart": {
+    "lines": [
+      { "id": "gid://shopify/CartLine/own1",
+        "cost": { "subtotalAmount": { "amount": "7000.0" } },
+        "giftTier": null,
+        "merchandise": { "__typename": "ProductVariant", "product": { "id": "gid://shopify/Product/PLAIN" } } },
+      { "id": "gid://shopify/CartLine/gift",
+        "cost": { "subtotalAmount": { "amount": "500.0" } },
+        "giftTier": { "value": "t_window" },
+        "merchandise": { "__typename": "ProductVariant", "product": { "id": "gid://shopify/Product/GIFT1" } } }
+    ]
+  },
+  "discount": {
+    "discountClasses": ["PRODUCT"],
+    "metafield": {
+      "jsonValue": {
+        "tiers": [
+          { "id": "t_window", "name": "Gift for Rs 6,000-7,999", "type": "order_subtotal",
+            "threshold": 6000, "thresholdMax": 7999, "enabled": true }
+        ]
+      }
+    }
+  }
+}

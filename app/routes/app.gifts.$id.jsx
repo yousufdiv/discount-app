@@ -22,6 +22,7 @@ export async function action({ request }) {
     name: f.get("name"),
     type: f.get("type"),
     threshold: f.get("threshold"),
+    thresholdMax: f.get("thresholdMax"),
     enabled: f.get("enabled") === "true",
     collectionGid: f.get("collectionGid") || null,
     giftProductGid: f.get("giftProductGid"),
@@ -38,6 +39,9 @@ export default function GiftEditor() {
   const [name, setName] = useState(tier?.name ?? "");
   const [type, setType] = useState(tier?.type ?? "order_subtotal");
   const [threshold, setThreshold] = useState(String(tier?.threshold ?? ""));
+  const [thresholdMax, setThresholdMax] = useState(
+    tier?.thresholdMax ? String(tier.thresholdMax) : "",
+  );
   const [enabled, setEnabled] = useState(tier?.enabled ?? true);
   const [collectionGid, setCollectionGid] = useState(tier?.collectionGid ?? "");
   const [collectionLabel, setCollectionLabel] = useState(tier?.collectionGid ? "Collection selected" : "");
@@ -46,6 +50,16 @@ export default function GiftEditor() {
 
   const needsCollection = type !== "order_subtotal";
   const needsThreshold = type !== "collection_contains";
+
+  // A blank cap is the normal case: the tier stays open-ended. A cap that isn't
+  // above the threshold would be a tier that can never fire, so block the save
+  // rather than let the merchant publish a dead tier.
+  const capValue = Number(thresholdMax);
+  const hasCap = thresholdMax !== "" && Number.isFinite(capValue);
+  const capError =
+    hasCap && capValue <= Number(threshold)
+      ? "The maximum must be higher than the threshold."
+      : "";
 
   const pickCollection = useCallback(async () => {
     const sel = await window.shopify.resourcePicker({ type: "collection", multiple: false });
@@ -67,11 +81,17 @@ export default function GiftEditor() {
     const data = { name, type, threshold, enabled: String(enabled), giftProductGid };
     if (tier?.id) data.id = tier.id;
     if (needsCollection) data.collectionGid = collectionGid;
+    // Always send it, blank included — that's how an existing cap gets cleared.
+    if (needsThreshold) data.thresholdMax = hasCap ? String(capValue) : "";
     submit(data, { method: "post" });
   };
 
   const canSave =
-    name && giftProductGid && (!needsCollection || collectionGid) && (!needsThreshold || Number(threshold) > 0);
+    name &&
+    giftProductGid &&
+    (!needsCollection || collectionGid) &&
+    (!needsThreshold || Number(threshold) > 0) &&
+    !capError;
 
   return (
     <s-page>
@@ -96,12 +116,23 @@ export default function GiftEditor() {
           </s-select>
 
           {needsThreshold && (
-            <s-number-field
-              label="Threshold (PKR)"
-              value={threshold}
-              min="1"
-              onChange={(e) => setThreshold(e.currentTarget.value)}
-            ></s-number-field>
+            <s-stack direction="block" gap="small">
+              <s-number-field
+                label="Threshold (PKR)"
+                value={threshold}
+                min="1"
+                details="The gift starts at this amount."
+                onChange={(e) => setThreshold(e.currentTarget.value)}
+              ></s-number-field>
+              <s-number-field
+                label="Maximum (PKR) — optional"
+                value={thresholdMax}
+                min="1"
+                error={capError || undefined}
+                details="Leave blank for no upper limit. Both ends count, so 6000 and 7999 gives the gift from Rs 6,000 up to and including Rs 7,999 — and stops at Rs 8,000."
+                onChange={(e) => setThresholdMax(e.currentTarget.value)}
+              ></s-number-field>
+            </s-stack>
           )}
 
           {needsCollection && (
