@@ -47,6 +47,12 @@ export default function GiftEditor() {
   const [collectionLabel, setCollectionLabel] = useState(tier?.collectionGid ? "Collection selected" : "");
   const [giftProductGid, setGiftProductGid] = useState(tier?.giftProductGid ?? "");
   const [giftLabel, setGiftLabel] = useState(tier?.giftProductTitle ?? "");
+  // A gift is free because its variant is priced Rs 0 — there is no discount. Catch
+  // a paid-only product here, at the moment of choosing, rather than letting the
+  // merchant find out from the tier list (or from a charged customer).
+  const [giftNotFree, setGiftNotFree] = useState(
+    tier ? Number(tier.giftVariantPrice ?? 0) > 0 : false,
+  );
 
   const needsCollection = type !== "order_subtotal";
   const needsThreshold = type !== "collection_contains";
@@ -74,6 +80,14 @@ export default function GiftEditor() {
     if (sel?.length) {
       setGiftProductGid(sel[0].id);
       setGiftLabel(sel[0].title);
+      // The picker usually carries variants with prices. When it doesn't, say
+      // nothing rather than guess — the server checks the real price on save.
+      const variants = sel[0].variants;
+      setGiftNotFree(
+        Array.isArray(variants) && variants.length
+          ? !variants.some((v) => Number(v.price) === 0)
+          : false,
+      );
     }
   }, []);
 
@@ -153,6 +167,19 @@ export default function GiftEditor() {
               <s-button onClick={pickGift}>{giftProductGid ? "Change gift" : "Select gift"}</s-button>
               {giftLabel && <s-text tone="subdued">{giftLabel}</s-text>}
             </s-stack>
+            <s-text tone="subdued">
+              Pick a dedicated Rs 0 product, not the saleable one. A Rs 0 price is what makes the
+              gift free — there is no discount — and adding a Rs 0 variant to a product you sell
+              would let anyone select it on the product page and take it for nothing.
+            </s-text>
+            {giftNotFree && (
+              <s-banner tone="warning">
+                This product has no Rs 0 variant, so the customer would be charged for the gift.
+                Create a separate product priced Rs 0 (for example “Free Gift – Mini Serum 10ml”),
+                then select that here. You can still save; the tier will show as broken and the
+                storefront will refuse to hand the gift out until it is free.
+              </s-banner>
+            )}
           </s-stack>
 
           <s-checkbox

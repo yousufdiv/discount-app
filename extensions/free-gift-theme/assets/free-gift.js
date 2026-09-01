@@ -2,8 +2,14 @@
   "use strict";
 
   // ---------------------------------------------------------------------------
-  // Free Gift — auto-add / auto-remove the gift line so the native BXGY
-  // discount can zero it out at checkout.
+  // Free Gift — auto-add / auto-remove the gift line.
+  //
+  // The gift is a Rs 0 variant, so nothing has to discount it: adding the line IS
+  // giving it away. (Earlier designs used a BXGY discount, then a Discount Function;
+  // Shopify only allows functions from a custom app on Shopify Plus stores, so the
+  // price itself became the mechanism.) That makes this script the only thing
+  // deciding who gets what — and the only thing that can protect the customer, so
+  // it removes any gift line it finds carrying a price. See dropPayableGifts.
   //
   // Theme independence is the hard requirement here: this ships to many
   // merchants on unknown themes, so we never reach into theme-specific DOM.
@@ -32,8 +38,10 @@
   var GIFT_PROP = window.__TSF_GIFT_PROP__ || "_gift";
   if (!TIERS.length) return;
 
-  // Each tier's name is the title of its automatic discount, so this is how we
-  // recognise a price reduction as OUR OWN doing. See lineValue().
+  // A tier's name is the title its automatic discount carried, back when tiers were
+  // backed by one. Nothing creates those discounts now, so this normally matches
+  // nothing — it is kept because it costs one string compare and it is what keeps
+  // lineValue() honest on any store that still has such a discount lying around.
   var OUR_DISCOUNT_TITLES = {};
   TIERS.forEach(function (t) { if (t.name) OUR_DISCOUNT_TITLES[t.name] = 1; });
 
@@ -106,17 +114,18 @@
   /**
    * What a line contributes to a tier's threshold.
    *
-   * This is `final_line_price` with OUR OWN gift discounts added back, and that
-   * detail is the whole ballgame. Shopify allocates a BXGY discount across the
-   * cart, so handing out a gift can reduce a real line's price. If we measured
-   * that reduced price, our own promotion would push the cart back under its own
-   * threshold — the tier would disqualify, we'd pull the gift, the price would go
-   * back up, the tier would qualify again. That feedback loop is what removed a
-   * gift whose condition was still genuinely met, and what made tiers flap.
+   * `final_line_price` with our own gift discounts added back. A tier's threshold
+   * must be judged on what the customer chose to buy, independent of what we gave
+   * them for it: an allocation of ours reducing a real line's price would push the
+   * cart back under its own threshold, so the tier would disqualify, we'd pull the
+   * gift, the price would go back up, and the tier would qualify again. That
+   * feedback loop is what used to remove a gift whose condition was still met.
    *
-   * A tier's threshold must therefore be judged on what the customer chose to
-   * buy, independent of what we gave them for it. Discounts from anything else
-   * (the merchant's own sales, codes) stay deducted — those are real.
+   * A Rs 0 gift allocates nothing, so today this is normally just
+   * `final_line_price` — but the guard has to stay, because it is what keeps the
+   * loop from coming back on a store that still has an old gift discount active.
+   * Discounts from anything else (the merchant's own sales, codes) stay deducted —
+   * those are real reductions in what the customer is spending.
    */
   function lineValue(l) {
     var allocations = l.line_level_discount_allocations || l.discount_allocations || [];
@@ -715,10 +724,10 @@
         var ok = qualifies(t, cart);
         qualifying[t.id] = ok;
         if (ok && !present[t.id]) {
-          // Shopify already refused to discount this gift for this exact cart.
+          // This tier's gift already turned out to cost money for this exact cart.
           if (isBlocked(t.id, fingerprint)) return;
           // The same physical gift is already in the cart under another tier.
-          // Only one line can be discounted, so a second would be charged for.
+          // Adding it again would just hand out two of the same thing.
           if (presentVariants[t.giftVariantId]) {
             debug("skipping", t.id, "— its gift variant is already in the cart");
             return;
@@ -752,18 +761,20 @@
 
     /**
      * A gift the customer would actually PAY for must never be left in the cart.
-     * The BXGY discount can fail to zero the line for reasons invisible from
-     * here — the merchant deleted or expired the discount, or two tiers competed
-     * for the same cart items and Shopify only honoured one.
+     * This is the safety net, and with no discount in play it is the ONLY one.
+     *
+     * A gift line costs money when the tier points at a priced variant rather than
+     * the Rs 0 one — the merchant edited the price in Shopify, or picked a product
+     * that never had a free variant. The app warns about both, but the storefront
+     * must not depend on the merchant having seen the warning.
      *
      * Two different situations end up here, and they must not be treated alike:
      *
-     *   - The tier no longer qualifies. The gift is on its way out anyway and its
-     *     discount has simply lapsed. Remove it, and do NOT hold it against the
-     *     tier — it did nothing wrong.
-     *   - The tier DOES qualify and Shopify still won't discount the gift. That's
-     *     a real conflict. Remove it and block the tier for this cart, so we don't
-     *     add/remove on a loop (which is what desynced the theme).
+     *   - The tier no longer qualifies. The gift is on its way out anyway. Remove
+     *     it, and do NOT hold it against the tier — it did nothing wrong.
+     *   - The tier DOES qualify and the line still costs money. That is a real
+     *     misconfiguration. Remove it and block the tier for this cart, so we don't
+     *     add and remove it on a loop (which is what desynced the theme).
      */
     function dropPayableGifts(cart) {
       var payable = [];

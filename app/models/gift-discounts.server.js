@@ -1,43 +1,41 @@
 // app/models/gift-discounts.server.js
 //
-// ONE automatic app discount, backed by our Discount Function, covers every tier.
+// The gift is a Rs 0 variant. No discount is involved at all.
 //
-// It used to be one native Buy X Get Y discount per tier, and that could not work.
-// A BXGY discount *consumes* the cart items that satisfy its "customer buys"
-// condition, and separate BXGY discounts compete for the same items — with three
-// tiers the first two ate the qualifying spend and the third had nothing left, so
-// its gift was never discounted. BXGY also has no "any product" condition, which
-// forced an auto-created "All products" smart collection, and that collection
-// overlapped the merchant's real collections and made the competition worse.
+// Two earlier designs are worth knowing about, because both are dead ends:
 //
-// The function evaluates all tiers itself, in one pass over one cart, so tiers
-// stack cleanly: Rs 5,000 and Rs 10,000 both pay out on a Rs 12,000 cart.
+//   1. One native Buy X Get Y discount per tier. A BXGY discount *consumes* the
+//      cart items satisfying its "customer buys" condition, and separate BXGY
+//      discounts compete for the same items — with three tiers the first two ate
+//      the qualifying spend and the third's gift was never discounted.
+//   2. One automatic app discount backed by our Discount Function. Correct, and it
+//      passed every test — on a development store. Shopify only lets stores on the
+//      Shopify Plus plan use functions from a CUSTOM app ("Shop must be on a
+//      Shopify Plus plan to activate functions from a custom app"), and this app is
+//      custom-distribution. Public App Store apps have no such restriction, which
+//      is why competing apps manage it.
+//      https://shopify.dev/docs/apps/build/functions
 //
-// Two copies of the tier config, for two different readers:
-//   SHOP metafield (storefront PUBLIC_READ) -> the theme, which adds/removes the
-//     gift line. Needs numeric ids, because it matches against /cart.js.
-//   DISCOUNT metafield -> the function, which decides which gift lines are free.
-//     Needs GIDs, because it matches against merchandise.product.id.
-// upsertTier writes both, so they can't drift apart.
+// So the gift carries no price to discount away: the merchant creates a Rs 0
+// variant, and the theme adds and removes that line. Every tier rule — thresholds,
+// the min/max window, collection conditions — lives in the theme script, which was
+// already the only thing deciding WHICH gift to add. Nothing is lost, and it works
+// on every plan.
+//
+// The safety net moves accordingly. There is no discount whose absence could charge
+// a customer; instead the gift variant's PRICE is the thing that must be zero, so
+// that is what getTiersWithHealth checks, and the theme independently pulls any
+// gift line it finds with a non-zero price.
+//
+// The discount function in extensions/free-gift-discount is deliberately left in
+// place, unused: it becomes correct again the day this ships as a public app.
 
 export const SHOP_NS = "theskinfit_gift";
 export const SHOP_KEY = "gift_tiers";
 
-// Where we remember the single app discount we own.
+// Where a previous version recorded the app discount it created. Still read, so a
+// store that ran that version gets the stale discount cleaned up on the next save.
 const DISCOUNT_ID_KEY = "discount_node";
-
-// Must match the `handle` in extensions/free-gift-discount/shopify.extension.toml.
-const FUNCTION_HANDLE = "free-gift-discount";
-const DISCOUNT_TITLE = "Free Gift";
-
-// Matches the definition declared in shopify.app.toml:
-//   [discount.metafields.app.function-configuration]
-// which the function reads as metafield(namespace: "$app", key: "function-configuration").
-// On the write side MetafieldInput documents the namespace as alphanumeric,
-// hyphen and underscore only, so the reserved `$app` form may be rejected there —
-// hence the fallback list rather than a single guess.
-const FN_CONFIG_KEY = "function-configuration";
-const FN_CONFIG_NAMESPACES = ["$app", "app"];
 
 const numId = (gid) => (gid ? Number(String(gid).split("/").pop()) : null);
 
@@ -51,21 +49,6 @@ const capOrNull = (raw) => {
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : null;
 };
-
-/**
- * True when a mutation failed because the discount is no longer there — the
- * merchant deleted it directly in the Shopify admin. Shopify reports this as
- * "Automatic discount does not exist."
- */
-function isMissingDiscount(err) {
-  const m = String(err?.message ?? "").toLowerCase();
-  return m.includes("does not exist") || m.includes("not found");
-}
-
-function isNamespaceError(err) {
-  const m = String(err?.message ?? "").toLowerCase();
-  return m.includes("namespace");
-}
 
 async function gql(admin, query, variables) {
   const res = await admin.graphql(query, { variables });
@@ -173,6 +156,18 @@ async function cacheCollectionProducts(admin, collectionGid) {
   return { gids, ids: gids.map(numId) };
 }
 
+/**
+ * The variant to hand out as the gift, and what it costs.
+ *
+ * The merchant picks a PRODUCT, so we choose the variant — and we deliberately
+ * prefer a Rs 0 one. That is the whole mechanism now: a gift product typically has
+ * its normal saleable variant alongside a Rs 0 "gift" variant, and blindly taking
+ * `variants(first: 1)` would hand out the paid one and charge the customer for
+ * their gift.
+ *
+ * The price comes back with it so the caller can record it and warn the merchant
+ * when no free variant exists.
+ */
 async function giftDetails(admin, giftProductGid) {
   const d = await gql(
     admin,
@@ -180,138 +175,60 @@ async function giftDetails(admin, giftProductGid) {
     query P($id: ID!) {
       product(id: $id) {
         title
-        variants(first: 1) { nodes { id } }
+        variants(first: 100) { nodes { id price } }
       }
     }`,
     { id: giftProductGid },
   );
-  const variantGid = d?.product?.variants?.nodes?.[0]?.id ?? null;
-  return { title: d?.product?.title ?? "Gift", variantGid, variantId: numId(variantGid) };
-}
-
-// ---------------------------------------------------------------------------
-// The single app discount
-// ---------------------------------------------------------------------------
-/** Only what the function actually needs — the metafield has a size limit. */
-function functionConfig(tiers) {
-  return JSON.stringify({
-    tiers: tiers
-      .filter((t) => t.enabled !== false)
-      .map((t) => ({
-        id: t.id,
-        name: t.name,
-        type: t.type,
-        threshold: t.threshold,
-        thresholdMax: t.thresholdMax ?? null,
-        enabled: true,
-        collectionProductGids: t.collectionProductGids ?? [],
-      })),
-  });
-}
-
-function discountInput(tiers, namespace) {
+  const nodes = d?.product?.variants?.nodes ?? [];
+  const free = nodes.find((v) => Number(v.price) === 0);
+  const chosen = free ?? nodes[0] ?? null;
   return {
-    title: DISCOUNT_TITLE,
-    functionHandle: FUNCTION_HANDLE,
-    startsAt: new Date(0).toISOString(),
-    discountClasses: ["PRODUCT"],
-    // A gift must still be free when the customer is already using another
-    // promotion, so opt into combining with every class.
-    combinesWith: { orderDiscounts: true, productDiscounts: true, shippingDiscounts: true },
-    metafields: [
-      { namespace, key: FN_CONFIG_KEY, type: "json", value: functionConfig(tiers) },
-    ],
+    title: d?.product?.title ?? "Gift",
+    variantGid: chosen?.id ?? null,
+    variantId: numId(chosen?.id),
+    variantPrice: chosen ? Number(chosen.price) : null,
   };
 }
 
-/**
- * Run `mutate(namespace)` against each candidate namespace until one is accepted.
- * Only namespace rejections are retried; anything else is a real failure.
- */
-async function withConfigNamespace(mutate) {
-  let lastErr = null;
-  for (const ns of FN_CONFIG_NAMESPACES) {
-    try {
-      return await mutate(ns);
-    } catch (e) {
-      if (!isNamespaceError(e)) throw e;
-      lastErr = e;
-    }
-  }
-  throw lastErr ?? new Error("Could not write the function configuration metafield.");
-}
-
-async function createDiscount(admin, tiers) {
-  const id = await withConfigNamespace(async (namespace) => {
-    const d = await gql(
-      admin,
-      `#graphql
-      mutation CreateGiftDiscount($automaticAppDiscount: DiscountAutomaticAppInput!) {
-        discountAutomaticAppCreate(automaticAppDiscount: $automaticAppDiscount) {
-          automaticAppDiscount { discountId }
-          userErrors { field message }
-        }
-      }`,
-      { automaticAppDiscount: discountInput(tiers, namespace) },
-    );
-    const errs = d.discountAutomaticAppCreate.userErrors;
-    if (errs.length) throw new Error(errs.map((e) => e.message).join("; "));
-    return d.discountAutomaticAppCreate.automaticAppDiscount.discountId;
-  });
-  await writeShopMetafield(admin, DISCOUNT_ID_KEY, id, "single_line_text_field");
-  return id;
-}
-
-async function updateDiscount(admin, id, tiers) {
-  await withConfigNamespace(async (namespace) => {
-    const d = await gql(
-      admin,
-      `#graphql
-      mutation UpdateGiftDiscount($id: ID!, $automaticAppDiscount: DiscountAutomaticAppInput!) {
-        discountAutomaticAppUpdate(id: $id, automaticAppDiscount: $automaticAppDiscount) {
-          userErrors { field message }
-        }
-      }`,
-      { id, automaticAppDiscount: discountInput(tiers, namespace) },
-    );
-    const errs = d.discountAutomaticAppUpdate.userErrors;
-    if (errs.length) throw new Error(errs.map((e) => e.message).join("; "));
-  });
+// ---------------------------------------------------------------------------
+// Cleaning up after the two designs that came before
+// ---------------------------------------------------------------------------
+async function deleteAutomaticDiscount(admin, id) {
+  await gql(
+    admin,
+    `#graphql
+    mutation DelDiscount($id: ID!) {
+      discountAutomaticDelete(id: $id) { userErrors { field message } }
+    }`,
+    { id },
+  ).catch(() => {}); // already gone, or not ours any more — either way, move on
 }
 
 /**
- * Push the current tier list into the function's configuration, creating the
- * discount on first use. Self-heals if the merchant deleted it in the admin.
- */
-async function syncDiscount(admin, tiers) {
-  const storedId = await readShopMetafield(admin, DISCOUNT_ID_KEY);
-  if (!storedId) return createDiscount(admin, tiers);
-  try {
-    await updateDiscount(admin, storedId, tiers);
-    return storedId;
-  } catch (e) {
-    if (!isMissingDiscount(e)) throw e;
-    return createDiscount(admin, tiers);
-  }
-}
-
-/**
- * Delete the leftover per-tier BXGY discounts from the old design. Called on
- * save, so the first save after upgrading cleans up automatically instead of
- * leaving stale discounts fighting the function for the same cart items.
+ * Delete the leftover per-tier BXGY discounts from the oldest design.
  */
 async function removeLegacyBxgyDiscounts(admin, tiers) {
-  const ids = tiers.map((t) => t.discountNodeId).filter(Boolean);
-  for (const id of ids) {
-    await gql(
-      admin,
-      `#graphql
-      mutation DelLegacy($id: ID!) {
-        discountAutomaticDelete(id: $id) { userErrors { field message } }
-      }`,
-      { id },
-    ).catch(() => {}); // already gone, or not ours any more — either way, move on
+  for (const id of tiers.map((t) => t.discountNodeId).filter(Boolean)) {
+    await deleteAutomaticDiscount(admin, id);
   }
+}
+
+/**
+ * Delete the single "Free Gift" app discount, if a previous version of this app
+ * managed to create one.
+ *
+ * This matters on any store where the function version worked — a development
+ * store, or a Plus store. Left behind, that discount would keep running the
+ * function against a configuration nobody updates any more, and could zero a line
+ * the theme no longer considers a gift. Nothing reads it now, so it has to go.
+ */
+async function removeManagedAppDiscount(admin) {
+  const storedId = await readShopMetafield(admin, DISCOUNT_ID_KEY);
+  if (!storedId) return;
+  await deleteAutomaticDiscount(admin, storedId);
+  // Clear the pointer too, so this runs once rather than on every save.
+  await writeShopMetafield(admin, DISCOUNT_ID_KEY, "", "single_line_text_field").catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +253,7 @@ export async function upsertTier(admin, form) {
     giftProductId: numId(form.giftProductGid),
     giftVariantGid: null,
     giftVariantId: null,
+    giftVariantPrice: null,
     giftProductTitle: "",
     enabled: form.enabled !== false,
     createdAt: existing?.createdAt || new Date().toISOString(),
@@ -351,21 +269,33 @@ export async function upsertTier(admin, form) {
   tier.giftProductTitle = gift.title;
   tier.giftVariantGid = gift.variantGid;
   tier.giftVariantId = gift.variantId;
+  tier.giftVariantPrice = gift.variantPrice;
 
   const idx = tiers.findIndex((t) => t.id === tier.id);
   if (idx >= 0) tiers[idx] = tier;
   else tiers.push(tier);
 
+  // Both older designs left automatic discounts behind. Clear them on save so a
+  // store that ran either one converges on the Rs 0 variant mechanism instead of
+  // having a stale discount still acting on the cart.
   await removeLegacyBxgyDiscounts(admin, tiers);
-  // The function is the source of truth for what is free, so it has to know
-  // about the tier before the theme starts handing its gift out.
-  await syncDiscount(admin, tiers);
-  await persistTiers(admin, tiers.map(({ discountNodeId, ...rest }) => rest));
+  await removeManagedAppDiscount(admin);
+
+  // Drop the legacy per-tier discount pointer as the list is rewritten — the
+  // discount it referred to has just been deleted.
+  await persistTiers(
+    admin,
+    tiers.map((t) => {
+      const copy = { ...t };
+      delete copy.discountNodeId;
+      return copy;
+    }),
+  );
   return tier;
 }
 
 // ---------------------------------------------------------------------------
-// Pause / resume and delete — all just reshape the one discount's config
+// Pause / resume and delete — the tier list is the only state there is
 // ---------------------------------------------------------------------------
 export async function setTierEnabled(admin, id, enabled) {
   const tiers = await getTiers(admin);
@@ -374,70 +304,76 @@ export async function setTierEnabled(admin, id, enabled) {
 
   tier.enabled = enabled;
   tier.updatedAt = new Date().toISOString();
-  await syncDiscount(admin, tiers);
   await persistTiers(admin, tiers);
 }
 
 export async function deleteTier(admin, id) {
   const tiers = await getTiers(admin);
   const tier = tiers.find((t) => t.id === id);
-  const remaining = tiers.filter((t) => t.id !== id);
 
   // Clean up the tier's own legacy BXGY discount, if it still has one.
   if (tier?.discountNodeId) await removeLegacyBxgyDiscounts(admin, [tier]);
 
-  await syncDiscount(admin, remaining);
-  await persistTiers(admin, remaining);
+  await persistTiers(admin, tiers.filter((t) => t.id !== id));
 }
 
 // ---------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------
 /**
- * Tiers annotated with the state of the one discount that backs them all. If it
- * is missing or inactive, no gift can be made free, and the merchant needs to
- * know before customers start seeing gifts they'd be charged for.
+ * Tiers annotated with whether their gift is actually free.
+ *
+ * With no discount in the picture, the gift variant's price IS the mechanism. A
+ * tier pointed at a priced variant would put a line the customer pays for into
+ * their cart and call it a gift, so this is the one thing worth checking — and it
+ * is checked live, because a merchant can edit the price in Shopify long after the
+ * tier was saved.
  */
 export async function getTiersWithHealth(admin) {
   const tiers = await getTiers(admin);
   if (!tiers.length) return [];
 
-  let status = null;
-  let checked = false;
+  const ids = [...new Set(tiers.map((t) => t.giftVariantGid).filter(Boolean))];
+  let livePrice = null;
   try {
-    const storedId = await readShopMetafield(admin, DISCOUNT_ID_KEY);
-    if (storedId) {
+    if (ids.length) {
       const d = await gql(
         admin,
         `#graphql
-        query GiftDiscountHealth($id: ID!) {
-          node(id: $id) {
-            ... on DiscountAutomaticNode {
-              automaticDiscount {
-                __typename
-                ... on DiscountAutomaticApp { status }
-              }
-            }
+        query GiftVariantPrices($ids: [ID!]!) {
+          nodes(ids: $ids) {
+            ... on ProductVariant { id price }
           }
         }`,
-        { id: storedId },
+        { ids },
       );
-      status = d?.node?.automaticDiscount?.status ?? null;
+      livePrice = new Map(
+        (d?.nodes ?? []).filter(Boolean).map((v) => [v.id, Number(v.price)]),
+      );
+    } else {
+      livePrice = new Map();
     }
-    checked = true;
   } catch {
-    // Fail OPEN: reporting a healthy tier as broken switches off a working
-    // promotion, which is worse than being slow to notice a broken one. The
-    // storefront's own "a gift must be free" check is the real safety net.
-    checked = false;
+    // Fail OPEN: flagging a working tier as broken switches off a live promotion,
+    // which is worse than being slow to notice a broken one. The theme does its own
+    // check on every cart — it removes any gift line with a price — so a
+    // misconfigured tier still can't charge a customer while we're in the dark.
+    livePrice = null;
   }
 
-  // A tier is only broken if we actually established that the discount is gone
-  // or not running.
-  const broken = checked && status !== "ACTIVE";
-  return tiers.map((t) => ({
-    ...t,
-    discountStatus: status,
-    broken: broken && t.enabled !== false,
-  }));
+  return tiers.map((t) => {
+    if (!livePrice) return { ...t, broken: false, brokenReason: null };
+
+    let reason = null;
+    if (!t.giftVariantGid) reason = "No gift variant";
+    else if (!livePrice.has(t.giftVariantGid)) reason = "Gift variant deleted";
+    else if (livePrice.get(t.giftVariantGid) > 0) reason = "Gift is not free";
+
+    return {
+      ...t,
+      giftVariantPrice: livePrice.get(t.giftVariantGid) ?? t.giftVariantPrice ?? null,
+      broken: !!reason && t.enabled !== false,
+      brokenReason: reason,
+    };
+  });
 }
