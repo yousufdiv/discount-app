@@ -2,11 +2,13 @@
 
 client_id = "84543886ba4dae45627d49741ba7a5e1"
 name = "discount-app"
-application_url = "https://example.com"
+application_url = "https://discount-app-production-716f.up.railway.app"
 embedded = true
 
 [build]
-automatically_update_urls_on_dev = true
+# Must stay false now that application_url points at production: shopify app dev
+# would otherwise overwrite it with a temporary tunnel and take the live app down.
+automatically_update_urls_on_dev = false
 
 [webhooks]
 api_version = "2026-07"
@@ -45,4 +47,6 @@ access.admin = "merchant_read_write"
 access.storefront = "none"
 
 [auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+# /auth/callback comes from authPathPrefix in app/shopify.server.js. Do not change
+# this to /api/auth — that is not a route this app serves.
+redirect_urls = [ "https://discount-app-production-716f.up.railway.app/auth/callback" ]
