@@ -103,7 +103,29 @@
   // ---- read (Ajax API — universal) -----------------------------------------
   function readCart() {
     return origFetch(ROOT + "cart.js", { headers: { Accept: "application/json" } })
-      .then(function (r) { return r.json(); });
+      .then(function (r) { return r.json(); })
+      .then(function (cart) { rememberGiftLines(cart); return cart; });
+  }
+
+  // Which cart lines are gifts, by line key and by 1-based position. Refreshed on
+  // every cart read, because the guard below has to recognise a gift line in a
+  // request body that is on its way out — there is no time to go and ask.
+  var giftKeys = {};      // line key -> true
+  var giftPositions = {}; // 1-based line index -> true
+  var cartLineCount = 0;
+
+  function rememberGiftLines(cart) {
+    giftKeys = {};
+    giftPositions = {};
+    cartLineCount = 0;
+    if (!cart || !cart.items) return;
+    cartLineCount = cart.items.length;
+    cart.items.forEach(function (l, i) {
+      if (isGift(l)) {
+        giftKeys[l.key] = true;
+        giftPositions[i + 1] = true;
+      }
+    });
   }
 
   function isGift(line) { return !!(line.properties && line.properties[GIFT_PROP]); }
@@ -251,6 +273,9 @@
       return res.json().then(
         function (data) {
           if (data && data.sections) lastSections = data.sections;
+          // Keep the guard's picture current the moment our own write lands — the
+          // theme's next write can arrive before any reconcile reads the cart.
+          if (isFullCart(data)) rememberGiftLines(data);
           return { ok: res.ok, status: res.status, body: data };
         },
         function () { return { ok: res.ok, status: res.status, body: null }; },
@@ -695,11 +720,43 @@
   }
 
   /**
+   * A gift line is always quantity 1. Put it back if it isn't.
+   *
+   * We only ever add with quantity 1, so an inflated gift line is somebody else's
+   * write. Themes address cart lines by 1-based index, and inserting a gift shifts
+   * every index the theme has already rendered — so a customer setting their own
+   * line to 7 can land that 7 on the gift line instead. The reported symptom was
+   * exactly that: the gift quantity tracking the quantity of the product that
+   * earned it, seven products giving seven gifts.
+   *
+   * We can't stop a theme writing to a stale index, and we can't tell afterwards
+   * which write did it. So this doesn't try to detect the cause — it treats
+   * "every gift line is quantity 1" as an invariant and re-establishes it at the
+   * start of every pass, before anything is measured or planned.
+   *
+   * Resolves to { cart, fixed }.
+   */
+  function fixGiftQuantities(cart) {
+    var updates = {};
+    var found = 0;
+    cart.items.forEach(function (l) {
+      if (isGift(l) && l.quantity !== 1) { updates[l.key] = 1; found++; }
+    });
+    if (!found) return Promise.resolve({ cart: cart, fixed: false });
+
+    debug("gift line quantity was not 1 — correcting", updates);
+    return post("cart/update.js", { updates: updates })
+      .then(function (r) { return isFullCart(r.body) ? r.body : readCart(); })
+      .catch(function () { return readCart(); })
+      .then(function (fresh) { return { cart: fresh, fixed: true }; });
+  }
+
+  /**
    * One reconcile pass over the given cart. Resolves to { changed, cart }, where
    * `cart` is the freshest state this pass knows about — the next pass plans from
    * it directly instead of re-reading.
    */
-  function onePass(cart) {
+  function onePass(startCart) {
     var wanted = [];       // tiers we attempted to add this pass
     var removals = [];     // tier ids whose gift should come out
     var qualifying = {};   // tierId -> whether its condition holds right now
@@ -838,42 +895,94 @@
       };
     }
 
-    plan(cart);
-    if (!wanted.length && !removals.length) {
-      // Nothing to do — but an existing gift line may still be payable (the
-      // merchant just deleted its discount), so always run the safety net.
-      return dropPayableGifts(cart).then(function (r) {
-        if (!r.payable.length) return { changed: false, cart: r.cart };
-        return finish(r.cart, r.payable);
-      });
-    }
+    // Correct any inflated gift line BEFORE measuring anything: a gift line at
+    // quantity 7 is not what the customer earned, and planning against it would
+    // just bake the mistake into the next decision.
+    return fixGiftQuantities(startCart).then(function (q) {
+      var cart = q.cart;
+      // A quantity correction is itself a change — the loop has to run again and
+      // the theme has to be told, or the drawer keeps showing 7.
+      var withFix = function (r) { return { changed: r.changed || q.fixed, cart: r.cart }; };
 
-    // One atomic batch: adds and removals together, so the theme's rendered
-    // line keys and indices are invalidated once instead of once per line.
-    return applyChanges(wanted, removals, cart)
-      // Trust nothing: work from what is actually in the cart afterwards. This is
-      // what keeps the popup honest — a gift that failed to add (sold out,
-      // inventory policy "deny", quantity limits) won't be there — and it's how we
-      // catch a removal that silently didn't take effect. When the mutation
-      // already handed back the whole cart we use that; only otherwise do we read.
-      .then(function (after) { return after || readCart(); })
-      .then(dropPayableGifts)
-      .then(function (r) { return finish(r.cart, r.payable); });
+      plan(cart);
+      if (!wanted.length && !removals.length) {
+        // Nothing to add or remove — but an existing gift line may still carry a
+        // price, so always run the safety net.
+        return dropPayableGifts(cart).then(function (r) {
+          if (!r.payable.length) return { changed: q.fixed, cart: r.cart };
+          return withFix(finish(r.cart, r.payable));
+        });
+      }
+
+      // One atomic batch: adds and removals together, so the theme's rendered
+      // line keys and indices are invalidated once instead of once per line.
+      return applyChanges(wanted, removals, cart)
+        // Trust nothing: work from what is actually in the cart afterwards. This is
+        // what keeps the popup honest — a gift that failed to add (sold out,
+        // inventory policy "deny", quantity limits) won't be there — and it's how we
+        // catch a removal that silently didn't take effect. When the mutation
+        // already handed back the whole cart we use that; only otherwise do we read.
+        .then(function (after) { return after || readCart(); })
+        .then(dropPayableGifts)
+        .then(function (r) { return withFix(finish(r.cart, r.payable)); });
+    });
   }
 
   // ---- popup ---------------------------------------------------------------
+  //
+  // The toast has to sit above the cart drawer, and z-index cannot do that. A
+  // drawer opened with dialog.showModal() lives in the browser's TOP LAYER, which
+  // renders above every z-index there is — which is why the toast was appearing
+  // behind it. The Popover API puts our toast in that same top layer without
+  // making it modal, so it stays click-through and never traps focus.
+  //
+  // Elements in the top layer stack in the order they were promoted, so a drawer
+  // opened after us would still cover us. Hence the hide-then-show below: every
+  // announcement re-promotes the toast to the front.
+  var TOAST_EXIT_MS = 340; // must outlast the CSS transition, or it vanishes mid-slide
   var timer;
+  var exitTimer;
+
+  function toastSupportsPopover(el) {
+    return typeof el.showPopover === "function" && el.hasAttribute("popover");
+  }
+
+  function showToast(el) {
+    el.hidden = false; // `hidden` would keep it display:none even while open
+    if (!toastSupportsPopover(el)) return;
+    try { el.hidePopover(); } catch (e) {} // ignore: it simply wasn't open
+    try { el.showPopover(); } catch (e) {}
+  }
+
+  function hideToast(el) {
+    if (toastSupportsPopover(el)) {
+      try { el.hidePopover(); } catch (e) {}
+      return;
+    }
+    el.hidden = true;
+  }
+
   function popup(text) {
     var el = document.getElementById("tsf-gift-popup");
     if (!el) return;
     el.querySelector(".tsf-gift-popup__text").textContent = text;
-    el.hidden = false;
-    requestAnimationFrame(function () { el.setAttribute("data-show", "true"); });
+
     clearTimeout(timer);
+    clearTimeout(exitTimer);
+    showToast(el);
+
+    // Two frames, not one: the first commits the element's newly shown layout at
+    // its off-screen start position, the second flips the attribute so there is
+    // something to transition FROM. One frame can land in the same style
+    // recalculation and skip the animation entirely.
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () { el.setAttribute("data-show", "true"); });
+    });
+
     timer = setTimeout(function () {
       el.setAttribute("data-show", "false");
       pendingToast = null;
-      setTimeout(function () { el.hidden = true; }, 300);
+      exitTimer = setTimeout(function () { hideToast(el); }, TOAST_EXIT_MS);
     }, 4000);
   }
 
@@ -934,6 +1043,185 @@
    * round trip that followed. A short window merges the burst instead, so we react
    * roughly a quarter of a second sooner and still only run once.
    */
+  // ---- guard: a gift line can never exceed quantity 1 ----------------------
+  //
+  // Correcting an inflated gift line after the fact is not enough, and the
+  // storefront proved it: /cart.js on the cart page reported the gift at 1 while
+  // checkout showed 5. A theme renders its cart form once and submits the cached
+  // `updates` it captured then — so the LAST write before the customer leaves the
+  // storefront can put the stale quantity straight back, and checkout is built
+  // from that. Reconciling can't win a race it only learns about afterwards.
+  //
+  // So the write is clamped in flight instead. This is the one place where the
+  // interceptor stops being a pure observer. Two rules keep it safe:
+  //
+  //   - Only ever clamp DOWN to 1, and only a gift line. A customer's own
+  //     quantity is never touched.
+  //   - Prefer the line KEY, which is unambiguous. A positional update is clamped
+  //     only when the body's line count matches the cart we last read; a mismatch
+  //     means our picture is stale, and quietly rewriting the wrong line's
+  //     quantity would be far worse than letting one extra gift through.
+  //
+  // Known gap: a theme that passes a Request object to fetch (rather than a url
+  // plus init) writes past this. The reconcile pass is still the backstop there.
+  var GIFT_MAX = 1;
+
+  /** Clamp a parsed JSON cart body in place. True when something changed. */
+  function clampJsonBody(o) {
+    if (!o || typeof o !== "object") return false;
+    var changed = false;
+
+    // change.js — { id: <key>, quantity: n } or { line: <1-based index>, quantity: n }
+    if (o.quantity !== undefined) {
+      var targetsGift =
+        (o.id !== undefined && giftKeys[String(o.id)]) ||
+        (o.line !== undefined && giftPositions[Number(o.line)]);
+      if (targetsGift && Number(o.quantity) > GIFT_MAX) {
+        o.quantity = GIFT_MAX;
+        changed = true;
+      }
+    }
+
+    // update.js — { updates: { <key>: n } } or { updates: [n, n, ...] }
+    var u = o.updates;
+    if (u && typeof u === "object") {
+      if (Object.prototype.toString.call(u) === "[object Array]") {
+        if (u.length === cartLineCount) {
+          for (var i = 0; i < u.length; i++) {
+            if (giftPositions[i + 1] && Number(u[i]) > GIFT_MAX) { u[i] = GIFT_MAX; changed = true; }
+          }
+        } else {
+          debug("positional updates:", u.length, "vs", cartLineCount, "cart lines — not clamping");
+        }
+      } else {
+        Object.keys(u).forEach(function (k) {
+          if (giftKeys[k] && Number(u[k]) > GIFT_MAX) { u[k] = GIFT_MAX; changed = true; }
+        });
+      }
+    }
+    return changed;
+  }
+
+  /** Clamp a URLSearchParams or FormData body in place. True when it changed. */
+  function clampParams(p) {
+    var changed = false;
+    var names = [];
+    p.forEach(function (v, k) { if (names.indexOf(k) === -1) names.push(k); });
+
+    // change.js style: id=<key>&quantity=n, or line=<index>&quantity=n
+    if (names.indexOf("quantity") !== -1) {
+      var id = p.get("id");
+      var line = p.get("line");
+      if (((id && giftKeys[id]) || (line && giftPositions[Number(line)])) &&
+          Number(p.get("quantity")) > GIFT_MAX) {
+        p.set("quantity", String(GIFT_MAX));
+        changed = true;
+      }
+    }
+
+    // updates[<key>]=n — the cart form's per-line inputs
+    names.forEach(function (k) {
+      var m = /^updates\[(.+)\]$/.exec(k);
+      if (m && giftKeys[m[1]] && Number(p.get(k)) > GIFT_MAX) {
+        p.set(k, String(GIFT_MAX));
+        changed = true;
+      }
+    });
+
+    // updates[]=n&updates[]=n — positional
+    var name = p.getAll("updates[]").length ? "updates[]" : "updates";
+    var positional = p.getAll(name);
+    if (positional.length) {
+      if (positional.length !== cartLineCount) {
+        debug("positional updates:", positional.length, "vs", cartLineCount, "cart lines — not clamping");
+      } else {
+        var next = positional.map(function (v, i) {
+          return giftPositions[i + 1] && Number(v) > GIFT_MAX ? String(GIFT_MAX) : v;
+        });
+        if (next.join(" ") !== positional.join(" ")) {
+          p.delete(name);
+          next.forEach(function (v) { p.append(name, v); });
+          changed = true;
+        }
+      }
+    }
+    return changed;
+  }
+
+  /** The body to actually send. Returns the same reference when nothing changed. */
+  function clampCartWriteBody(body) {
+    if (!body) return body;
+
+    if (typeof body === "string") {
+      if (body.charAt(0) === "{" || body.trim().charAt(0) === "{") {
+        try {
+          var parsed = JSON.parse(body);
+          return clampJsonBody(parsed) ? JSON.stringify(parsed) : body;
+        } catch (e) {
+          return body;
+        }
+      }
+      try {
+        var params = new URLSearchParams(body);
+        return clampParams(params) ? params.toString() : body;
+      } catch (e) {
+        return body;
+      }
+    }
+
+    // FormData exposes the same get/set/getAll/append surface clampParams uses.
+    if (typeof FormData !== "undefined" && body instanceof FormData) {
+      try { clampParams(body); } catch (e) {}
+      return body;
+    }
+
+    return body;
+  }
+
+  // A theme's cart form posts its cached `updates` straight to /cart on the way to
+  // checkout — a full page navigation, with no fetch or XHR to intercept. So repair
+  // the inputs instead, on the way out. The form is NOT cancelled: the customer
+  // reaches checkout exactly as they expect. Blocking that button was never an
+  // option on a live store; only the gift's quantity is held down.
+  document.addEventListener(
+    "submit",
+    function (e) {
+      var form = e.target;
+      var action = form && form.action ? String(form.action) : "";
+      if (!/\/cart(\/|\?|$)/.test(action)) return;
+
+      var inputs = form.querySelectorAll("[name^='updates']");
+      if (!inputs.length) return;
+
+      var fixed = 0;
+      var positional = [];
+      for (var i = 0; i < inputs.length; i++) {
+        var m = /^updates\[(.*)\]$/.exec(inputs[i].getAttribute("name") || "");
+        var key = m ? m[1] : null;
+        if (key) {
+          if (giftKeys[key] && Number(inputs[i].value) > GIFT_MAX) {
+            inputs[i].value = String(GIFT_MAX);
+            fixed++;
+          }
+        } else {
+          positional.push(inputs[i]);
+        }
+      }
+      if (positional.length && positional.length !== cartLineCount) {
+        debug("cart form has", positional.length, "positional inputs vs", cartLineCount, "cart lines — not clamping");
+      } else {
+        for (var j = 0; j < positional.length; j++) {
+          if (giftPositions[j + 1] && Number(positional[j].value) > GIFT_MAX) {
+            positional[j].value = String(GIFT_MAX);
+            fixed++;
+          }
+        }
+      }
+      if (fixed) debug("held", fixed, "gift quantity input(s) at 1 before the cart form submitted");
+    },
+    true, // capture, so we run before any theme handler reads the form
+  );
+
   var RECONCILE_DEBOUNCE_MS = 60;
   var scheduled = null;
   var rerunRequested = false;
@@ -977,17 +1265,25 @@
   //    It never alters the request, the response, or the timing.
   var standardEventsSeen = false;
   var patchedFetch = function () {
-    var url = arguments[0] && (arguments[0].url || arguments[0]);
-    var init = arguments[1];
+    var args = Array.prototype.slice.call(arguments);
+    var url = args[0] && (args[0].url || args[0]);
+    var init = args[1];
     if (typeof url === "string" && /\/cart\/(add|change|update|clear)/.test(url)) {
       rememberSections(init && init.body);
-      var p = origFetch.apply(this, arguments);
+      if (init && init.body) {
+        var guarded = clampCartWriteBody(init.body);
+        if (guarded !== init.body) {
+          debug("held a gift line at quantity 1 in an outgoing cart write");
+          args[1] = Object.assign({}, init, { body: guarded });
+        }
+      }
+      var p = origFetch.apply(this, args);
       if (!standardEventsSeen) {
         p.then(function () { scheduleReconcile(); }).catch(function () {});
       }
       return p;
     }
-    return origFetch.apply(this, arguments);
+    return origFetch.apply(this, args);
   };
 
   // 3. Older themes (jQuery and friends) still use XMLHttpRequest.
@@ -1000,9 +1296,15 @@
   var patchedSend = function (body) {
     if (this.__tsfCart) {
       rememberSections(body);
+      var guarded = clampCartWriteBody(body);
+      if (guarded !== body) {
+        debug("held a gift line at quantity 1 in an outgoing XHR cart write");
+        body = guarded;
+      }
       if (!standardEventsSeen) {
         this.addEventListener("load", function () { scheduleReconcile(); });
       }
+      return XhrSend.call(this, body);
     }
     return XhrSend.apply(this, arguments);
   };

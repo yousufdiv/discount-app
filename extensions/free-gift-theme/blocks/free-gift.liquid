@@ -13,7 +13,13 @@
     window.__TSF_GIFT_PROP__ = "_gift";
   </script>
 
-  <div id="tsf-gift-popup" class="tsf-gift-popup" role="status" aria-live="polite" hidden>
+  {%- comment -%}
+    popover="manual" puts the toast in the browser's top layer, the only way to get
+    above a cart drawer opened with dialog.showModal(). "manual" so it is never
+    light-dismissed by a tap elsewhere, and never modal. Browsers without popover
+    support ignore the attribute and fall back to the z-index below.
+  {%- endcomment -%}
+  <div id="tsf-gift-popup" class="tsf-gift-popup" role="status" aria-live="polite" popover="manual" hidden>
     <span class="tsf-gift-popup__icon">🎁</span>
     <span class="tsf-gift-popup__text"></span>
   </div>
@@ -22,16 +28,28 @@
 
   {% style %}
     .tsf-gift-popup{
-      position:fixed; left:20px; bottom:20px; z-index:2147483646;
+      /* `inset:auto` and the margin/border/padding resets undo the user-agent
+         stylesheet for [popover], which centres it with inset:0 + margin:auto and
+         draws a border. Without these the toast lands in the middle of the screen. */
+      position:fixed; inset:auto; margin:0; border:0; overflow:visible;
+      left:50%; bottom:calc(env(safe-area-inset-bottom, 0px) + 20px);
+      z-index:2147483646;             /* fallback for browsers without popover */
       pointer-events:none;            /* passive toast — never intercept clicks (e.g. checkout) */
-      display:flex; align-items:center; gap:10px; max-width:320px;
+      display:flex; align-items:center; gap:10px;
+      width:max-content; max-width:min(360px, calc(100vw - 32px));
       padding:14px 18px; background:#0B7A3B; color:#fff; border-radius:12px;
-      box-shadow:0 8px 24px rgba(0,0,0,.18); font-size:14px; line-height:1.35;
-      transform:translateY(16px); opacity:0;
-      transition:opacity .25s ease, transform .25s ease;
+      box-shadow:0 8px 24px rgba(0,0,0,.22); font-size:14px; line-height:1.35;
+      /* Starts fully below the bottom edge, so it slides up into view and slides
+         straight back down — it is never parked over the checkout button. */
+      transform:translate(-50%, calc(100% + 32px)); opacity:0;
+      transition:opacity .28s ease, transform .32s cubic-bezier(.22,.61,.36,1);
     }
-    .tsf-gift-popup[data-show="true"]{ transform:translateY(0); opacity:1; }
+    .tsf-gift-popup[data-show="true"]{ transform:translate(-50%, 0); opacity:1; }
     .tsf-gift-popup__icon{ font-size:20px; }
+
+    @media (prefers-reduced-motion: reduce){
+      .tsf-gift-popup{ transition:opacity .2s ease; transform:translate(-50%, 0); }
+    }
   {% endstyle %}
 {% endif %}
 
